@@ -1399,12 +1399,14 @@ out:
 // Likewise, boot check will block message processing => use a thread
 static DWORD WINAPI BootCheckThread(LPVOID param)
 {
-	int i, r, username_index = -1;
+	int i, r, rr, username_index = -1;
 	FILE *fd;
-	DWORD len;
+	uint32_t len;
+	uint8_t* buf = NULL;
 	WPARAM ret = BOOTCHECK_CANCEL;
 	BOOL in_files_dir = FALSE, esp_already_asked = FALSE;
 	BOOL is_windows_to_go = ((image_options & IMOP_WINTOGO) && (ComboBox_GetCurItemData(hImageOption) == IMOP_WIN_TO_GO));
+	const char* msg;
 	const char* grub = "grub";
 	const char* core_img = "core.img";
 	const char* ldlinux = "ldlinux";
@@ -1584,6 +1586,10 @@ static DWORD WINAPI BootCheckThread(LPVOID param)
 				StrArrayAdd(&options, lmprintf(MSG_335), TRUE);
 				MAP_BIT(UNATTEND_DISABLE_BITLOCKER);
 				if (expert_mode) {
+					if (!appstore_version && img_report.win_version.build >= 26100) {
+						StrArrayAdd(&options, lmprintf(MSG_350), TRUE);
+						MAP_BIT(UNATTEND_USE_MS2023_BOOTLOADERS);
+					}
 					StrArrayAdd(&options, lmprintf(MSG_346), TRUE);
 					MAP_BIT(UNATTEND_FORCE_S_MODE);
 				}
@@ -1595,7 +1601,7 @@ static DWORD WINAPI BootCheckThread(LPVOID param)
 				i = remap16(i, map, TRUE);
 				unattend_xml_path = CreateUnattendXml(arch, i);
 				// Remember the user preferences for the current session.
-				unattend_xml_mask &= ~(remap16(0x1ff, map, TRUE));
+				unattend_xml_mask &= ~(remap16(UNATTEND_FULL_MASK, map, TRUE));
 				unattend_xml_mask |= i;
 				WriteSetting32(SETTING_WUE_OPTIONS, (UNATTEND_DEFAULT_MASK << 16) | unattend_xml_mask);
 			}
@@ -1603,23 +1609,49 @@ static DWORD WINAPI BootCheckThread(LPVOID param)
 
 		// Check UEFI bootloaders for revocation
 		if (IS_EFI_BOOTABLE(img_report)) {
-			uint8_t* buf = NULL;
-			uint32_t len;
-			const char* msg;
-
-			for (i = 0; i < ARRAYSIZE(img_report.efi_boot_path) && img_report.efi_boot_path[i][0] != 0; i++) {
-				len = ReadISOFileToBuffer(image_path, img_report.efi_boot_path[i], &buf);
-				if (len == 0) {
-					uprintf("Warning: Failed to extract '%s' to check for UEFI revocation", img_report.efi_boot_path[i]);
-					continue;
+			BOOL has_secureboot_signed_bootloader = FALSE;
+			assert(ARRAYSIZE(img_report.efi_boot_entry) > 0);
+			PrintStatus(0, MSG_351);
+			uuprintf("UEFI Secure Boot revocation checks:");
+			// Make sure we have at least one regular EFI bootloader that is formally signed
+			// for Secure Boot, since it doesn't make sense to report revocation otherwise.
+			for (i = 0; !has_secureboot_signed_bootloader && i < ARRAYSIZE(img_report.efi_boot_entry) &&
+				img_report.efi_boot_entry[i].path[0] != 0; i++) {
+				if (img_report.efi_boot_entry[i].type == EBT_MAIN) {
+					len = ReadISOFileToBuffer(image_path, img_report.efi_boot_entry[i].path, &buf);
+					if (len == 0) {
+						uprintf("Warning: Failed to extract '%s' to check for UEFI revocation", img_report.efi_boot_entry[i].path);
+						continue;
+					}
+					if (IsSignedBySecureBootAuthority(buf, len))
+						has_secureboot_signed_bootloader = TRUE;
+					free(buf);
 				}
-				r = IsBootloaderRevoked(buf, len);
-				safe_free(buf);
-				if (r > 0) {
-					uprintf("Warning: '%s' is revoked by %s", img_report.efi_boot_path[i],
-						(r == 1) ? "UEFI DBX" : ((r == 2) ? "Windows SSP" : "Linux SBAT"));
-					is_bootloader_revoked = TRUE;
-					switch (r) {
+			}
+			if (!has_secureboot_signed_bootloader) {
+				uuprintf("  No Secure Boot signed bootloader found -- skipping");
+			} else {
+				rr = 0;
+				for (i = 0; i < ARRAYSIZE(img_report.efi_boot_entry) && img_report.efi_boot_entry[i].path[0] != 0; i++) {
+					static const char* revocation_type[] = { "UEFI DBX", "Windows SSP", "Linux SBAT", "Windows SVN", "Cert DBX" };
+					len = ReadISOFileToBuffer(image_path, img_report.efi_boot_entry[i].path, &buf);
+					if (len == 0) {
+						uprintf("Warning: Failed to extract '%s' to check for UEFI revocation", img_report.efi_boot_entry[i].path);
+						continue;
+					}
+					uuprintf("• %s", img_report.efi_boot_entry[i].path);
+					r = IsBootloaderRevoked(buf, len);
+					safe_free(buf);
+					if (r > 0) {
+						assert(r <= ARRAYSIZE(revocation_type));
+						if (rr == 0)
+							rr = r;
+						uprintf("Warning: '%s' has been revoked by %s", img_report.efi_boot_entry[i].path, revocation_type[r - 1]);
+						is_bootloader_revoked = TRUE;
+					}
+				}
+				if (rr > 0) {
+					switch (rr) {
 					case 2:
 						msg = lmprintf(MSG_341, "Error code: 0xc0000428");
 						break;
@@ -1631,7 +1663,6 @@ static DWORD WINAPI BootCheckThread(LPVOID param)
 						MB_OKCANCEL | MB_ICONWARNING | MB_IS_RTL, selected_langid);
 					if (r == IDCANCEL)
 						goto out;
-					break;
 				}
 			}
 		}
@@ -1688,7 +1719,6 @@ static DWORD WINAPI BootCheckThread(LPVOID param)
 					IGNORE_RETVAL(_chdir(tmp));
 					// The following loops through the grub2 version (which may have the ISO label appended)
 					// and breaks it according to '.' or '-' until it finds a match on the server.
-					// 
 					for (i = (int)strlen(img_report.grub2_version), grub2_len = 0; i > 0 && grub2_len <= 0; i--) {
 						c = img_report.grub2_version[i];
 						if (c != 0 && c != '.' && c != '-')
@@ -1719,7 +1749,7 @@ static DWORD WINAPI BootCheckThread(LPVOID param)
 		if ((partition_type == PARTITION_STYLE_MBR) && HAS_SYSLINUX(img_report)) {
 			if (SL_MAJOR(img_report.sl_version) < 5) {
 				IGNORE_RETVAL(_chdirU(app_data_dir));
-				for (i = 0; i<NB_OLD_C32; i++) {
+				for (i = 0; i < NB_OLD_C32; i++) {
 					if (img_report.has_old_c32[i]) {
 						if (!in_files_dir) {
 							IGNORE_RETVAL(_mkdir(FILES_DIR));
@@ -1758,7 +1788,7 @@ static DWORD WINAPI BootCheckThread(LPVOID param)
 				IGNORE_RETVAL(_chdirU(app_data_dir));
 				IGNORE_RETVAL(_mkdir(FILES_DIR));
 				IGNORE_RETVAL(_chdir(FILES_DIR));
-				for (i=0; i<2; i++) {
+				for (i = 0; i < 2; i++) {
 					// Check if we already have the relevant ldlinux_v#.##.sys & ldlinux_v#.##.bss files
 					static_sprintf(tmp, "%s-%s%s\\%s.%s", syslinux, img_report.sl_version_str,
 						img_report.sl_version_ext, ldlinux, ldlinux_ext[i]);
@@ -1780,7 +1810,7 @@ static DWORD WINAPI BootCheckThread(LPVOID param)
 						lmprintf(MSG_115), MB_YESNO | MB_ICONWARNING | MB_IS_RTL, selected_langid);
 					if (r != IDYES)
 						goto out;
-					for (i=0; i<2; i++) {
+					for (i = 0; i < 2; i++) {
 						static_sprintf(tmp, "%s-%s", syslinux, img_report.sl_version_str);
 						IGNORE_RETVAL(_mkdir(tmp));
 						if (*img_report.sl_version_ext != 0) {
@@ -2091,6 +2121,7 @@ static void InitDialog(HWND hDlg)
 	// Create the string arrays
 	StrArrayCreate(&BlockingProcessList, 16);
 	StrArrayCreate(&ImageList, 16);
+	StrArrayCreate(&modified_files, 8);
 	// Set various checkboxes
 	CheckDlgButton(hDlg, IDC_QUICK_FORMAT, BST_CHECKED);
 	CheckDlgButton(hDlg, IDC_EXTENDED_LABEL, BST_CHECKED);
@@ -2265,6 +2296,7 @@ static INT_PTR CALLBACK MainCallback(HWND hDlg, UINT message, WPARAM wParam, LPA
 			StopProcessSearch();
 			StrArrayDestroy(&BlockingProcessList);
 			StrArrayDestroy(&ImageList);
+			StrArrayDestroy(&modified_files);
 			DestroyAllTooltips();
 			DestroyWindow(hLogDialog);
 			GetWindowRect(hDlg, &relaunch_rc);
@@ -2967,6 +2999,7 @@ static INT_PTR CALLBACK MainCallback(HWND hDlg, UINT message, WPARAM wParam, LPA
 			if (!Notification(MSG_WARNING_QUESTION, NULL, NULL, title, lmprintf(MSG_132)))
 				goto aborted_start;
 		}
+		PrintStatus(0, MSG_142);
 
 		GetWindowTextU(hDeviceList, tmp, ARRAYSIZE(tmp));
 		if (MessageBoxExU(hMainDialog, lmprintf(MSG_003, tmp),
@@ -3002,6 +3035,9 @@ static INT_PTR CALLBACK MainCallback(HWND hDlg, UINT message, WPARAM wParam, LPA
 		if (queued_hotplug_event)
 			SendMessage(hDlg, UM_MEDIA_CHANGE, 0, 0);
 		if (wParam == BOOTCHECK_CANCEL) {
+			nb_devices = ComboBox_GetCount(hDeviceList);
+			PrintStatus(0, (nb_devices == 1) ? MSG_208 : MSG_209, nb_devices);
+			PrintStatus(5000, MSG_041);
 			if (unattend_xml_path != NULL) {
 				DeleteFileU(unattend_xml_path);
 				unattend_xml_path = NULL;
@@ -3498,7 +3534,7 @@ skip_args_processing:
 	is_vds_available = IsVdsAvailable(FALSE);
 	use_vds = ReadSettingBool(SETTING_USE_VDS) && is_vds_available;
 	usb_debug = ReadSettingBool(SETTING_ENABLE_USB_DEBUG);
-	cdio_loglevel_default = usb_debug ? CDIO_LOG_DEBUG : CDIO_LOG_WARN;
+	cdio_loglevel_default = usb_debug ? CDIO_LOG_INFO : CDIO_LOG_WARN;
 	use_rufus_mbr = !ReadSettingBool(SETTING_DISABLE_RUFUS_MBR);
 //	validate_md5sum = ReadSettingBool(SETTING_ENABLE_RUNTIME_VALIDATION);
 	detect_fakes = !ReadSettingBool(SETTING_DISABLE_FAKE_DRIVES_CHECK);
@@ -3789,7 +3825,7 @@ extern int TestHashes(void);
 			// Alt-. => Enable USB enumeration debug
 			if ((msg.message == WM_SYSKEYDOWN) && (msg.wParam == VK_OEM_PERIOD)) {
 				usb_debug = !usb_debug;
-				cdio_loglevel_default = usb_debug ? CDIO_LOG_DEBUG : CDIO_LOG_WARN;
+				cdio_loglevel_default = usb_debug ? CDIO_LOG_INFO : CDIO_LOG_WARN;
 				WriteSettingBool(SETTING_ENABLE_USB_DEBUG, usb_debug);
 				PrintStatusTimeout(lmprintf(MSG_270), usb_debug);
 				GetDevices(0);
