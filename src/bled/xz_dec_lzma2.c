@@ -641,7 +641,8 @@ static void XZ_FUNC lzma_len(struct xz_dec_lzma2 *s, struct lzma_len_dec *l,
 		}
 	}
 
-	s->lzma.len += rc_bittree(&s->rc, probs, limit) - limit;
+	if (rc_bittree(&s->rc, probs, limit) >= limit)
+		s->lzma.len += rc_bittree(&s->rc, probs, limit) - limit;
 }
 
 /* Decode a match. The distance will be stored in s->lzma.rep0. */
